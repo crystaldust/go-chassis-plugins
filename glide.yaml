@@ -1,26 +1,45 @@
 package: github.com/go-chassis/go-chassis-plugins
-ignore:
-- github.com/ServiceComb/go-chassis
 import:
-- package: k8s.io/client-go
-  version: 7c4d4e9c37e45f111d4ca76c6e38f7d65bd4a44e
-  repo: https://github.com/kubernetes/client-go
+- package: github.com/envoyproxy/go-control-plane
+  version: ^0.5.0
   subpackages:
-  - kubernetes/fake
+  - envoy/api/v2
+  - envoy/api/v2/core
+  - envoy/service/discovery/v2
+- package: github.com/go-chassis/go-chassis
+  version: ^0.8.0
+  subpackages:
+  - core/common
+  - core/lager
+  - core/registry
+  - pkg/util/tags
+- package: github.com/gogo/protobuf
+  version: ^1.1.1
+  subpackages:
+  - proto
+- package: google.golang.org/grpc
+  version: ^1.14.0
+- package: k8s.io/api
+  subpackages:
+  - core/v1
+- package: k8s.io/apimachinery
+  subpackages:
+  - pkg/labels
+- package: k8s.io/client-go
+  version: ^8.0.0
+  subpackages:
+  - informers
+  - informers/core/v1
   - kubernetes
-  - tools
-- package: golang.org/x/crypto
-  version: 49796115aa4b964c318aad4f3084fdb41e9aa067
-  repo: https://github.com/golang/crypto
-- package: golang.org/x/time
-  version: f51c12702a4d776e4c1fa9b0fabab841babae631
-  repo: https://github.com/golang/time
-- package: golang.org/x/net
-  version: 1c05540f6879653db88113bc4a2b70aec4bd491f
-  repo: https://github.com/golang/net
-- package: golang.org/x/sys
-  version: 95c6576299259db960f6c5b9b69ea52422860fce
-  repo: https://github.com/golang/sys
-- package: golang.org/x/text
-  version: b19bf474d317b857955b12035d2c5acb57ce8b01
-  repo: https://github.com/golang/text
+  - listers/core/v1
+  - tools/cache
+  - tools/clientcmd
+testImport:
+- package: github.com/ServiceComb/go-chassis
+  version: ^0.8.0
+  subpackages:
+  - core/lager
+- package: github.com/stretchr/testify
+  version: ^1.2.2
+  subpackages:
+  - assert
