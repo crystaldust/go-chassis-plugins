@@ -3,7 +3,6 @@ package pilotv2
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 
 	apiv2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
@@ -14,10 +13,12 @@ import (
 )
 
 type XdsClient struct {
-	PilotAddr string
-	GrpcConn  *grpc.ClientConn
-
-	ReqCaches map[XdsType]*XdsReqCache
+	PilotAddr   string
+	GrpcConn    *grpc.ClientConn
+	ReqCaches   map[XdsType]*XdsReqCache
+	nodeInfo    *NodeInfo
+	NodeID      string
+	NodeCluster string
 }
 
 type XdsType string
@@ -34,11 +35,20 @@ type XdsReqCache struct {
 	VersionInfo string
 }
 
-func NewXdsClient(pilotAddr string, tlsConfig *tls.Config) (*XdsClient, error) {
+type NodeInfo struct {
+	PodName    string
+	Namespace  string
+	InstanceIP string
+}
+
+func NewXdsClient(pilotAddr string, tlsConfig *tls.Config, nodeInfo *NodeInfo) (*XdsClient, error) {
 	// TODO Handle the array
 	xdsClient := &XdsClient{
 		PilotAddr: pilotAddr,
+		nodeInfo:  nodeInfo,
 	}
+	xdsClient.NodeID = fmt.Sprintf("sidecar~%s~%s~%s", nodeInfo.InstanceIP, nodeInfo.PodName, nodeInfo.Namespace)
+	xdsClient.NodeCluster = fmt.Sprintf("%s.%s", nodeInfo.PodName, nodeInfo.Namespace)
 
 	// TODO Handle the TLS certs
 	conn, err := grpc.Dial(xdsClient.PilotAddr, grpc.WithInsecure())
@@ -101,8 +111,8 @@ func (client *XdsClient) CDS() ([]apiv2.Cluster, error) {
 		// Sample taken from istio: router~172.30.77.6~istio-egressgateway-84b4d947cd-rqt45.istio-system~istio-system.svc.cluster.local-2
 		// The Node.Id should be in format {nodeType}~{ipAddr}~{serviceId~{domain}, splitted by '~'
 		// The format is required by pilot
-		Id:      "sidecar~192.168.43.100~xds-api-test~localhost",
-		Cluster: "my-powerful-machine-ouya",
+		Id:      client.NodeID,
+		Cluster: client.NodeCluster,
 	}
 	if err := adsResClient.Send(req); err != nil {
 		return nil, err
@@ -144,8 +154,8 @@ func (client *XdsClient) EDS(clusterName string) ([]apiv2.ClusterLoadAssignment,
 	}
 
 	req.Node = &apiv2core.Node{
-		Id:      "sidecar~192.168.43.100~xds-api-test~localhost",
-		Cluster: "juzhen-x79",
+		Id:      client.NodeID,
+		Cluster: client.NodeCluster,
 	}
 	req.ResourceNames = []string{clusterName}
 	if err := adsResClient.Send(req); err != nil {
@@ -188,8 +198,8 @@ func (client *XdsClient) RDS(clusterName string) ([]apiv2.RouteConfiguration, er
 	}
 
 	req.Node = &apiv2core.Node{
-		Id:      "sidecar~192.168.43.100~xds-api-test~localhost",
-		Cluster: "juzhen-x79",
+		Id:      client.NodeID,
+		Cluster: client.NodeCluster,
 	}
 	req.ResourceNames = []string{clusterName}
 	if err := adsResClient.Send(req); err != nil {
@@ -232,8 +242,8 @@ func (client *XdsClient) LDS() ([]apiv2.Listener, error) {
 	}
 
 	req.Node = &apiv2core.Node{
-		Id:      "sidecar~192.168.43.100~xds-api-test~localhost",
-		Cluster: "juzhen-x79",
+		Id:      client.NodeID,
+		Cluster: client.NodeCluster,
 	}
 	if err := adsResClient.Send(req); err != nil {
 		return nil, err
@@ -265,9 +275,4 @@ func (client *XdsClient) LDS() ([]apiv2.Listener, error) {
 func xds(urlType string) error {
 
 	return nil
-}
-
-func jsonPrint(content interface{}) {
-	bs, _ := json.MarshalIndent(content, "", "  ")
-	fmt.Println(string(bs))
 }
