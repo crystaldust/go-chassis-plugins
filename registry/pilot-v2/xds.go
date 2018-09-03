@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"strings"
 
 	apiv2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	apiv2core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	apiv2route "github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
 	"github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
 	"github.com/gogo/protobuf/proto"
 	"google.golang.org/grpc"
@@ -48,7 +50,7 @@ func NewXdsClient(pilotAddr string, tlsConfig *tls.Config, nodeInfo *NodeInfo) (
 		nodeInfo:  nodeInfo,
 	}
 	xdsClient.NodeID = fmt.Sprintf("sidecar~%s~%s~%s", nodeInfo.InstanceIP, nodeInfo.PodName, nodeInfo.Namespace)
-	xdsClient.NodeCluster = fmt.Sprintf("%s.%s", nodeInfo.PodName, nodeInfo.Namespace)
+	xdsClient.NodeCluster = nodeInfo.PodName
 
 	// TODO Handle the TLS certs
 	conn, err := grpc.Dial(xdsClient.PilotAddr, grpc.WithInsecure())
@@ -79,6 +81,22 @@ func getAdsResClient(client *XdsClient) (v2.AggregatedDiscoveryService_StreamAgg
 	}
 
 	return adsResClient, nil
+}
+
+func (client *XdsClient) getRouterClusters(clusterName string) ([]string, error) {
+	virtualHosts, err := client.RDS(clusterName)
+	if err != nil {
+		return nil, err
+	}
+
+	routerClusters := []string{}
+	for _, h := range virtualHosts {
+		for _, r := range h.Routes {
+			routerClusters = append(routerClusters, r.GetRoute().GetCluster())
+		}
+	}
+
+	return routerClusters, nil
 }
 
 func (client *XdsClient) getVersionInfo(resType XdsType) string {
@@ -184,7 +202,11 @@ func (client *XdsClient) EDS(clusterName string) ([]apiv2.ClusterLoadAssignment,
 	return endpoints, nil
 }
 
-func (client *XdsClient) RDS(clusterName string) ([]apiv2.RouteConfiguration, error) {
+func (client *XdsClient) RDS(clusterName string) ([]apiv2route.VirtualHost, error) {
+	parts := strings.Split(clusterName, "|")
+	port := parts[1]
+	serviceName := parts[3]
+
 	adsResClient, err := getAdsResClient(client)
 	if err != nil {
 		fmt.Println("failed to get stream adsResClient")
@@ -216,16 +238,25 @@ func (client *XdsClient) RDS(clusterName string) ([]apiv2.RouteConfiguration, er
 	client.setVersionInfo(TypeRds, resp.GetVersionInfo())
 
 	var route apiv2.RouteConfiguration
-	routes := []apiv2.RouteConfiguration{}
+	virtualHosts := []apiv2route.VirtualHost{}
 
 	for _, res := range resources {
 		if err := proto.Unmarshal(res.GetValue(), &route); err != nil {
 			fmt.Println("Failed to unmarshal resource: ", err)
 		} else {
-			routes = append(routes, route)
+			vhosts := route.GetVirtualHosts()
+			for _, vhost := range vhosts {
+				if vhost.Name == fmt.Sprintf("%s:%s", serviceName, port) {
+					virtualHosts = append(virtualHosts, vhost)
+					for _, r := range vhost.Routes {
+						routerClusterName := r.GetRoute().GetCluster()
+						fmt.Println("[JUZHEN DEBUG]: ", routerClusterName)
+					}
+				}
+			}
 		}
 	}
-	return routes, nil
+	return virtualHosts, nil
 }
 
 func (client *XdsClient) LDS() ([]apiv2.Listener, error) {
