@@ -158,7 +158,7 @@ func (client *XdsClient) CDS() ([]apiv2.Cluster, error) {
 	return clusters, nil
 }
 
-func (client *XdsClient) EDS(clusterName string) ([]apiv2.ClusterLoadAssignment, error) {
+func (client *XdsClient) EDS(clusterName string) (*apiv2.ClusterLoadAssignment, error) {
 	adsResClient, err := getAdsResClient(client)
 	if err != nil {
 		fmt.Println("failed to get stream adsResClient")
@@ -189,17 +189,19 @@ func (client *XdsClient) EDS(clusterName string) ([]apiv2.ClusterLoadAssignment,
 	client.setNonce(TypeEds, resp.GetNonce())
 	client.setVersionInfo(TypeEds, resp.GetVersionInfo())
 
-	var endpoint apiv2.ClusterLoadAssignment
-	endpoints := []apiv2.ClusterLoadAssignment{}
+	var loadAssignment apiv2.ClusterLoadAssignment
+	var e error
+	// endpoints := []apiv2.ClusterLoadAssignment{}
 
 	for _, res := range resources {
-		if err := proto.Unmarshal(res.GetValue(), &endpoint); err != nil {
-			fmt.Println("Failed to unmarshal resource: ", err)
+		if err := proto.Unmarshal(res.GetValue(), &loadAssignment); err != nil {
+			e = err
 		} else {
-			endpoints = append(endpoints, endpoint)
+			// The cluster's LoadAssignment will always be ONE, with Endpoints as its field
+			break
 		}
 	}
-	return endpoints, nil
+	return &loadAssignment, e
 }
 
 func (client *XdsClient) RDS(clusterName string) ([]apiv2route.VirtualHost, error) {
