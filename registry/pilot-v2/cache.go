@@ -117,8 +117,8 @@ func (cm *CacheManager) MakeIPIndex() error {
 				if clusterInfo != nil && clusterInfo.Subset != "" { // Only clusters with subset contain labels
 					if tags, err := cm.GetSubsetTags(clusterInfo.Namespace, clusterInfo.ServiceName, clusterInfo.Subset); err == nil {
 						si.Tags = tags
-						fmt.Printf("%s:%d\n", socketAddress.GetAddress(), socketAddress.GetPortValue())
-						jsonPrint(si)
+						// fmt.Printf("%s:%d\n", socketAddress.GetAddress(), socketAddress.GetPortValue())
+						// jsonPrint(si)
 					}
 				}
 
