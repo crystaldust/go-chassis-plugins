@@ -8,6 +8,7 @@ import (
 
 	apiv2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	apiv2core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	apiv2endpoint "github.com/envoyproxy/go-control-plane/envoy/api/v2/endpoint"
 	apiv2route "github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
 	"github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
 	"github.com/gogo/protobuf/proto"
@@ -132,6 +133,7 @@ func (client *XdsClient) CDS() ([]apiv2.Cluster, error) {
 		Id:      client.NodeID,
 		Cluster: client.NodeCluster,
 	}
+
 	if err := adsResClient.Send(req); err != nil {
 		return nil, err
 	}
@@ -202,6 +204,53 @@ func (client *XdsClient) EDS(clusterName string) (*apiv2.ClusterLoadAssignment, 
 		}
 	}
 	return &loadAssignment, e
+}
+
+func (client *XdsClient) GetEndpointsByTags(serviceName string, tags map[string]string) ([]apiv2endpoint.LbEndpoint, string, error) {
+	clusters, err := client.CDS()
+	if err != nil {
+		return nil, "", err
+	}
+
+	lbendpoints := []apiv2endpoint.LbEndpoint{}
+	clusterName := ""
+	for _, cluster := range clusters {
+		clusterInfo := ParseClusterName(cluster.Name)
+		if clusterInfo == nil || clusterInfo.Subset == "" || clusterInfo.ServiceName != serviceName {
+			continue
+		}
+		fmt.Println("try ", cluster.Name)
+		// So clusterInfo is not nil and subset is not empty
+		if subsetTags, err := cacheManager.GetSubsetTags(clusterInfo.Namespace, clusterInfo.ServiceName, clusterInfo.Subset); err == nil {
+			fmt.Println("subsetTags: ", cluster.Name, subsetTags)
+			// filter with tags
+			matched := true
+			for k, v := range tags {
+				if subsetTagValue, exists := subsetTags[k]; exists == false || subsetTagValue != v {
+					fmt.Println(k, "not matching")
+					matched = false
+					break
+				}
+			}
+
+			if matched { // We got the cluster!
+				fmt.Println("matched!", cluster.Name)
+				clusterName = cluster.Name
+				loadAssignment, err := client.EDS(cluster.Name)
+				if err != nil {
+					return nil, clusterName, err
+				}
+
+				for _, item := range loadAssignment.Endpoints {
+					lbendpoints = append(lbendpoints, item.LbEndpoints...)
+				}
+
+				return lbendpoints, clusterName, nil
+			}
+		}
+	}
+
+	return lbendpoints, clusterName, nil
 }
 
 func (client *XdsClient) RDS(clusterName string) ([]apiv2route.VirtualHost, error) {

@@ -1,7 +1,6 @@
 package pilotv2
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -23,9 +22,10 @@ var (
 )
 
 type ServiceDiscovery struct {
-	Name    string
-	client  *XdsClient
-	options registry.Options
+	Name           string
+	client         *XdsClient
+	options        registry.Options
+	serviceNameMap map[string]string // Key: raw service name, Value: xDS cluster name, sampe: accounts => |outbound|3000|v2|accounts.default.svc.cluster.local|
 }
 
 func (discovery *ServiceDiscovery) GetMicroServiceID(appID, microServiceName, version, env string) (string, error) {
@@ -61,7 +61,7 @@ func toMicroService(cluster *apiv2.Cluster) *registry.MicroService {
 	return svc
 }
 
-func toMicroServiceInstance(clusterName string, lbendpoint *apiv2endpoint.LbEndpoint) *registry.MicroServiceInstance {
+func toMicroServiceInstance(clusterName string, lbendpoint *apiv2endpoint.LbEndpoint, tags map[string]string) *registry.MicroServiceInstance {
 	socketAddress := lbendpoint.Endpoint.Address.GetSocketAddress()
 	addr := socketAddress.Address
 	port := socketAddress.GetPortValue()
@@ -73,6 +73,7 @@ func toMicroServiceInstance(clusterName string, lbendpoint *apiv2endpoint.LbEndp
 	}
 	msi.DefaultEndpoint = fmt.Sprintf("%s:%d", addr, port)
 	msi.DefaultProtocol = common.ProtocolRest
+	msi.Metadata = tags
 
 	return msi
 }
@@ -124,7 +125,7 @@ func (discovery *ServiceDiscovery) GetMicroServiceInstances(consumerID, provider
 	endpionts := loadAssignment.Endpoints
 	for _, item := range endpionts {
 		for _, lbendpoint := range item.LbEndpoints {
-			msi := toMicroServiceInstance(loadAssignment.ClusterName, &lbendpoint)
+			msi := toMicroServiceInstance(loadAssignment.ClusterName, &lbendpoint, nil) // The cluster without subset doesn't have tags
 			instances = append(instances, msi)
 		}
 	}
@@ -132,64 +133,73 @@ func (discovery *ServiceDiscovery) GetMicroServiceInstances(consumerID, provider
 	return instances, nil
 }
 
+func wrapTags(tags map[string]string) map[string]string {
+	copy := map[string]string{}
+	for k, v := range tags {
+		copy[k] = v
+	}
+	if _, ok := copy[common.BuildinTagApp]; !ok {
+		copy[common.BuildinTagApp] = "default"
+	}
+	return copy
+}
+
 func (discovery *ServiceDiscovery) FindMicroServiceInstances(consumerID, microServiceName string, tags utiltags.Tags) ([]*registry.MicroServiceInstance, error) {
 	fmt.Println("FindMicroServiceInstances with params: ", consumerID, microServiceName, tags)
 	jsonPrint(tags)
+	// Try to get instances from index cache
 
-	clusters, err := discovery.client.CDS()
-	if err != nil {
-		return nil, err
+	var store interface{}
+	var storeExists bool
+	var clusterName string
+	var clusterNameExists bool
+
+	clusterName, clusterNameExists = discovery.serviceNameMap[microServiceName]
+
+	if clusterNameExists {
+		store, storeExists = registry.MicroserviceInstanceIndex.Get(microServiceName, wrapTags(tags.KV))
 	}
 
-	for _, cluster := range clusters {
-		clusterInfo := ParseClusterName(cluster.Name)
-		if clusterInfo == nil || clusterInfo.Subset == "" || clusterInfo.ServiceName != microServiceName {
-			continue
+	if !clusterNameExists || !storeExists || store == nil {
+		var lbendpoints []apiv2endpoint.LbEndpoint
+		var err error
+		lbendpoints, clusterName, err = discovery.client.GetEndpointsByTags(microServiceName, tags.KV)
+		if err != nil {
+			return nil, err
 		}
-		// So clusterInfo is not nil and subset is not empty
-		// TODO The code is ugly orgnized, optimize it later
-		if subsetTags, err := cacheManager.GetSubsetTags(clusterInfo.Namespace, clusterInfo.ServiceName, clusterInfo.Subset); err != nil {
-			//
-			continue
-		} else {
-			// filter with tags
-			matched := true
-			for k, v := range tags.KV {
-				if subsetTagValue, exists := subsetTags[k]; exists == false || subsetTagValue != v {
-					matched = false
-					continue
-				}
-			}
 
-			if matched { // We got the cluster!
-				fmt.Println("[JUZHEN DEBUG]: ", "We got the cluster ", cluster.Name)
-				jsonPrint(subsetTags)
+		discovery.serviceNameMap[microServiceName] = clusterName
 
-				loadAssignment, err := discovery.client.EDS(cluster.Name)
-				if err != nil {
-					return nil, err
-				}
+		updateInstanceIndexCache(lbendpoints, clusterName, wrapTags(tags.KV))
 
-				instances := []*registry.MicroServiceInstance{}
-				endpionts := loadAssignment.Endpoints
-				for _, item := range endpionts {
-					for _, lbendpoint := range item.LbEndpoints {
-						msi := toMicroServiceInstance(loadAssignment.ClusterName, &lbendpoint)
-						instances = append(instances, msi)
-					}
-				}
-
-				return instances, nil
-			}
+		//  Get instances from index
+		store, storeExists = registry.MicroserviceInstanceIndex.Get(clusterName, wrapTags(tags.KV))
+		if !storeExists || store == nil {
+			return nil, fmt.Errorf("Failed to find microservice instances of %s from cache", clusterName)
 		}
+
+		// TODO Remove this
+		// convert lbendpoints to instances.
+
+		// store = []*registry.MicroServiceInstance{}
+		// for _, e := range lbendpoints {
+		//     msi := toMicroServiceInstance(clusterName, &e, tags.KV)
+		//     // Not a good style to make convertion like this
+		//     store = append(store.([]*registry.MicroServiceInstance), msi)
+		// }
 	}
+
+	instances, ok := store.([]*registry.MicroServiceInstance)
+	if !ok {
+		// lager.Logger.Errorf(nil, "FindMicroServiceInstances failed, Type asserts failed. consumerIDL: %s", consumerID)
+		fmt.Printf("FindMicroServiceInstances failed, Type asserts failed. consumerIDL: %s\n", consumerID)
+	}
+	return instances, nil
 
 	// Get the cluster filtered by tags
 
 	// TODO Find micro service instances filtered by tags
 	// The tags are generated by the router rules
-
-	return nil, nil
 }
 
 var cacheManager *CacheManager
@@ -222,18 +232,16 @@ func NewDiscoveryService(options registry.Options) registry.ServiceDiscovery {
 		Namespace:  POD_NAMESPACE,
 		InstanceIP: INSTANCE_IP,
 	}
-	fmt.Println("init xds client with node Info:")
-	bs, _ := json.MarshalIndent(nodeInfo, "", " ")
-	fmt.Println(string(bs))
 	xdsClient, err := NewXdsClient(pilotAddr, options.TLSConfig, nodeInfo)
 	if err != nil {
 		panic("Failed to create XDS client: " + err.Error())
 	}
 
 	discovery := &ServiceDiscovery{
-		client:  xdsClient,
-		Name:    "pilotv2",
-		options: options,
+		client:         xdsClient,
+		Name:           "pilotv2",
+		options:        options,
+		serviceNameMap: map[string]string{},
 	}
 
 	return discovery
@@ -257,7 +265,6 @@ func init() {
 		//
 		fmt.Println("[WARN] Env var INSTANCE_IP not found, the service might not work properly.")
 		INSTANCE_IP = iputil.GetLocalIP()
-		fmt.Println("localip: ", INSTANCE_IP)
 		if INSTANCE_IP == "" {
 			// Won't work without instance ip
 			panic("Failed to get instance ip")

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	apiv2endpoint "github.com/envoyproxy/go-control-plane/envoy/api/v2/endpoint"
 	"github.com/go-chassis/go-chassis/core/archaius"
 	"github.com/go-chassis/go-chassis/core/config"
 	"github.com/go-chassis/go-chassis/core/registry"
@@ -69,13 +70,24 @@ func (cm *CacheManager) refreshCache() {
 }
 
 func (cm *CacheManager) pullMicroserviceInstance() error {
-	old := registry.MicroserviceInstanceIndex.Items()
-	labels := registry.MicroserviceInstanceIndex.GetIndexTags()
-	fmt.Println("pullMicroserviceInstance")
 
-	fmt.Println(len(old))
+	// Get all services.
+	clusterInfos, err := cm.getClusterInfos()
+	if err != nil {
+		return err
+	}
+
+	for _, clusterInfo := range clusterInfos {
+		registry.MicroserviceInstanceIndex.Set(clusterInfo.ServiceName, clusterInfo)
+	}
+
+	// old := registry.MicroserviceInstanceIndex.Items()
+	// labels := registry.MicroserviceInstanceIndex.GetIndexTags()
+	// fmt.Println("pullMicroserviceInstance")
+
+	// fmt.Println(len(old))
 	// jsonPrint(old)
-	jsonPrint(labels)
+	// jsonPrint(labels)
 
 	// for serviceKey, store := range old {
 	//     for key := range store.Items() {
@@ -90,6 +102,7 @@ func (cm *CacheManager) pullMicroserviceInstance() error {
 	return nil
 }
 
+// TODO Use getClusterInfo to replace the logic
 func (cm *CacheManager) MakeIPIndex() error {
 	fmt.Println("Make IP index")
 	clusters, err := cm.xdsClient.CDS()
@@ -180,7 +193,7 @@ func NewCacheManager(xdsClient *XdsClient, kubeConfig string) (*CacheManager, er
 	return cacheManager, nil
 }
 
-type XdsCluster struct {
+type XdsClusterInfo struct {
 	Direction    string
 	Port         string
 	Subset       string
@@ -188,9 +201,11 @@ type XdsCluster struct {
 	ServiceName  string
 	Namespace    string
 	DomainSuffix string // DomainSuffix might not be used
+	Tags         map[string]string
+	Addrs        []string // The accessible addresses of the endpoints
 }
 
-func ParseClusterName(clusterName string) *XdsCluster {
+func ParseClusterName(clusterName string) *XdsClusterInfo {
 	// clusterName format: |direction|port|subset|hostName|
 	// hostName format: |svc.namespace.svc.cluster.local
 
@@ -204,7 +219,7 @@ func ParseClusterName(clusterName string) *XdsCluster {
 		return nil
 	}
 
-	cluster := &XdsCluster{
+	cluster := &XdsClusterInfo{
 		Direction:    parts[0],
 		Port:         parts[1],
 		Subset:       parts[2],
@@ -215,4 +230,59 @@ func ParseClusterName(clusterName string) *XdsCluster {
 	}
 
 	return cluster
+}
+
+func (cm *CacheManager) getClusterInfos() ([]XdsClusterInfo, error) {
+	clusterInfos := []XdsClusterInfo{}
+
+	clusters, err := cm.xdsClient.CDS()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, cluster := range clusters {
+		// xDS v2 API: CDS won't obtain the cluster's endpoints, call EDS to get the endpoints
+
+		clusterInfo := ParseClusterName(cluster.Name)
+		if clusterInfo == nil {
+			continue
+		}
+
+		// Get Tags
+		if clusterInfo.Subset != "" { // Only clusters with subset contain labels
+			if tags, err := cm.GetSubsetTags(clusterInfo.Namespace, clusterInfo.ServiceName, clusterInfo.Subset); err == nil {
+				clusterInfo.Tags = tags
+			}
+		}
+
+		// Get cluster instances' addresses
+		loadAssignment, err := cm.xdsClient.EDS(cluster.Name)
+		if err != nil {
+			return nil, err
+		}
+		endpoints := loadAssignment.Endpoints
+		for _, endpoint := range endpoints {
+			for _, lbendpoint := range endpoint.LbEndpoints {
+				socketAddress := lbendpoint.Endpoint.Address.GetSocketAddress()
+				ipAddr := fmt.Sprintf("%s:%d", socketAddress.GetAddress(), socketAddress.GetPortValue())
+				clusterInfo.Addrs = append(clusterInfo.Addrs, ipAddr)
+			}
+		}
+	}
+	return clusterInfos, nil
+}
+
+func updateInstanceIndexCache(lbendpoints []apiv2endpoint.LbEndpoint, clusterName string, tags map[string]string) {
+	if len(lbendpoints) == 0 {
+		registry.MicroserviceInstanceIndex.Delete(clusterName)
+		return
+	}
+
+	store := make([]*registry.MicroServiceInstance, 0, len(lbendpoints))
+	for _, lbendpoint := range lbendpoints {
+		msi := toMicroServiceInstance(clusterName, &lbendpoint, tags)
+		store = append(store, msi)
+	}
+
+	registry.MicroserviceInstanceIndex.Set(clusterName, store)
 }
