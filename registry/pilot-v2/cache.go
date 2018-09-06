@@ -1,7 +1,6 @@
 package pilotv2
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -9,18 +8,25 @@ import (
 
 	apiv2endpoint "github.com/envoyproxy/go-control-plane/envoy/api/v2/endpoint"
 	"github.com/go-chassis/go-chassis/core/archaius"
+	"github.com/go-chassis/go-chassis/core/common"
 	"github.com/go-chassis/go-chassis/core/config"
 	"github.com/go-chassis/go-chassis/core/registry"
-	"k8s.io/client-go/rest"
 )
 
 const (
-	DefaultRefreshInterval = time.Second * 10
+	DefaultRefreshInterval = time.Second * 30
 )
+
+var simpleCache EndpointCache
+
+func init() {
+	simpleCache = EndpointCache{
+		cache: map[string]EndpointSubset{},
+	}
+}
 
 type CacheManager struct {
 	xdsClient *XdsClient
-	k8sClient *rest.RESTClient
 }
 
 func (cm *CacheManager) AutoSync() {
@@ -70,113 +76,64 @@ func (cm *CacheManager) refreshCache() {
 }
 
 func (cm *CacheManager) pullMicroserviceInstance() error {
-
-	// Get all services.
 	clusterInfos, err := cm.getClusterInfos()
 	if err != nil {
 		return err
 	}
 
 	for _, clusterInfo := range clusterInfos {
-		registry.MicroserviceInstanceIndex.Set(clusterInfo.ServiceName, clusterInfo)
+		if clusterInfo.Subset != "" {
+			if strings.Index(clusterInfo.ClusterName, "pilotv2server") != -1 {
+				fmt.Println("updating pilotv2,", clusterInfo.ClusterName)
+				fmt.Println(clusterInfo.Addrs)
+			}
+			// Update the cache
+			instances := []*registry.MicroServiceInstance{}
+			for _, addr := range clusterInfo.Addrs {
+				msi := &registry.MicroServiceInstance{}
+				msi.InstanceID = strings.Replace(addr, ":", "_", 0)
+				msi.HostName = clusterInfo.ClusterName
+				msi.EndpointsMap = map[string]string{
+					common.ProtocolRest: addr,
+				}
+				msi.DefaultEndpoint = addr
+				msi.DefaultProtocol = common.ProtocolRest
+				msi.Metadata = clusterInfo.Tags
+
+				instances = append(instances)
+			}
+
+			endpointSubset := EndpointSubset{
+				tags:      clusterInfo.Tags,
+				instances: instances,
+			}
+			simpleCache.Set(clusterInfo.ClusterName, endpointSubset)
+		}
 	}
 
-	// old := registry.MicroserviceInstanceIndex.Items()
-	// labels := registry.MicroserviceInstanceIndex.GetIndexTags()
-	// fmt.Println("pullMicroserviceInstance")
-
-	// fmt.Println(len(old))
-	// jsonPrint(old)
-	// jsonPrint(labels)
-
-	// for serviceKey, store := range old {
-	//     for key := range store.Items() {
-	//         tags := pilotTags(labels, key)
-	//         hs, err := cm.client.GetHostsByKey(serviceKey, tags)
-	//         if err != nil {
-	//             continue
-	//         }
-	//         filterRestore(hs.Hosts, serviceKey, tags)
-	//     }
-	// }
 	return nil
 }
 
 // TODO Use getClusterInfo to replace the logic
 func (cm *CacheManager) MakeIPIndex() error {
-	fmt.Println("Make IP index")
-	clusters, err := cm.xdsClient.CDS()
+	clusterInfos, err := cm.getClusterInfos()
 	if err != nil {
-		fmt.Println(err, "Failed to get clusters")
 		return err
 	}
-	for _, cluster := range clusters {
-		// xDS v2 API: CDS won't obtain the cluster's endpoints, call EDS to get the endpoints
-		loadAssignment, err := cm.xdsClient.EDS(cluster.Name)
-		if err != nil {
-			fmt.Println(err, "Failed to get endpoints of cluster %s", cluster.Name)
-			return err
-		}
 
-		endpoints := loadAssignment.Endpoints
-		for _, endpoint := range endpoints {
-			for _, lbendpoint := range endpoint.LbEndpoints {
-				socketAddress := lbendpoint.Endpoint.Address.GetSocketAddress()
-				si := &registry.SourceInfo{}
-				// TODO Get tags by subset and put them into si.Tags
-				si.Name = loadAssignment.ClusterName
-
-				clusterInfo := ParseClusterName(loadAssignment.ClusterName)
-				if clusterInfo != nil && clusterInfo.Subset != "" { // Only clusters with subset contain labels
-					if tags, err := cm.GetSubsetTags(clusterInfo.Namespace, clusterInfo.ServiceName, clusterInfo.Subset); err == nil {
-						si.Tags = tags
-						// fmt.Printf("%s:%d\n", socketAddress.GetAddress(), socketAddress.GetPortValue())
-						// jsonPrint(si)
-					}
-				}
-
-				ipAddr := fmt.Sprintf("%s:%d", socketAddress.GetAddress(), socketAddress.GetPortValue())
-				registry.SetIPIndex(ipAddr, si)
-				// TODO Why don't we have to index every endpoint?
-				// break
-			}
+	for _, clusterInfo := range clusterInfos {
+		for _, addr := range clusterInfo.Addrs {
+			si := &registry.SourceInfo{}
+			// TODO Get tags by subset and put them into si.Tags
+			si.Name = clusterInfo.ClusterName
+			si.Tags = clusterInfo.Tags
+			registry.SetIPIndex(addr, si)
+			// TODO Why don't we have to index every endpoint?
+			// break
 		}
 	}
+
 	return nil
-}
-
-func (cm *CacheManager) GetSubsetTags(namespace, hostName, subsetName string) (map[string]string, error) {
-	req := cm.k8sClient.Get()
-	req.Resource("destinationrules")
-	req.Namespace(namespace)
-
-	result := req.Do()
-	rawBody, err := result.Raw()
-	if err != nil {
-		fmt.Println("Failed to get rawBody: ", err)
-		return nil, err
-	}
-
-	var drResult DestinationRuleResult
-	json.Unmarshal(rawBody, &drResult)
-
-	// Find the subset
-	tags := map[string]string{}
-	for _, dr := range drResult.Items {
-		if dr.Spec.Host == hostName {
-			for _, subset := range dr.Spec.Subsets {
-				if subset.Name == subsetName {
-					for k, v := range subset.Labels {
-						tags[k] = v
-					}
-					break
-				}
-			}
-			break
-		}
-	}
-
-	return tags, nil
 }
 
 func NewCacheManager(xdsClient *XdsClient, kubeConfig string) (*CacheManager, error) {
@@ -184,16 +141,11 @@ func NewCacheManager(xdsClient *XdsClient, kubeConfig string) (*CacheManager, er
 		xdsClient: xdsClient,
 	}
 
-	k8sClient, err := CreateK8SRestClient(kubeConfig, "apis", "networking.istio.io", "v1alpha3")
-	if err != nil {
-		return nil, err
-	}
-	cacheManager.k8sClient = k8sClient
-
 	return cacheManager, nil
 }
 
 type XdsClusterInfo struct {
+	ClusterName  string
 	Direction    string
 	Port         string
 	Subset       string
@@ -227,6 +179,7 @@ func ParseClusterName(clusterName string) *XdsClusterInfo {
 		ServiceName:  hostnameParts[0],
 		Namespace:    hostnameParts[1],
 		DomainSuffix: strings.Join(hostnameParts[2:], "."),
+		ClusterName:  clusterName,
 	}
 
 	return cluster
@@ -250,7 +203,7 @@ func (cm *CacheManager) getClusterInfos() ([]XdsClusterInfo, error) {
 
 		// Get Tags
 		if clusterInfo.Subset != "" { // Only clusters with subset contain labels
-			if tags, err := cm.GetSubsetTags(clusterInfo.Namespace, clusterInfo.ServiceName, clusterInfo.Subset); err == nil {
+			if tags, err := cm.xdsClient.GetSubsetTags(clusterInfo.Namespace, clusterInfo.ServiceName, clusterInfo.Subset); err == nil {
 				clusterInfo.Tags = tags
 			}
 		}
@@ -272,17 +225,77 @@ func (cm *CacheManager) getClusterInfos() ([]XdsClusterInfo, error) {
 	return clusterInfos, nil
 }
 
+// TODO Cache with registry index cache
 func updateInstanceIndexCache(lbendpoints []apiv2endpoint.LbEndpoint, clusterName string, tags map[string]string) {
 	if len(lbendpoints) == 0 {
-		registry.MicroserviceInstanceIndex.Delete(clusterName)
+		simpleCache.Delete(clusterName)
 		return
 	}
 
-	store := make([]*registry.MicroServiceInstance, 0, len(lbendpoints))
+	instances := make([]*registry.MicroServiceInstance, 0, len(lbendpoints))
 	for _, lbendpoint := range lbendpoints {
 		msi := toMicroServiceInstance(clusterName, &lbendpoint, tags)
-		store = append(store, msi)
+		instances = append(instances, msi)
+	}
+	subset := EndpointSubset{
+		tags:      tags,
+		instances: instances,
+	}
+	simpleCache.Set(clusterName, subset)
+}
+
+type EndpointCache struct {
+	cache map[string]EndpointSubset
+}
+
+type EndpointSubset struct {
+	subsetName string
+	tags       map[string]string
+	instances  []*registry.MicroServiceInstance
+}
+
+func (c EndpointCache) Delete(clusterName string) {
+	delete(c.cache, clusterName)
+}
+
+func (c EndpointCache) Set(clusterName string, subset EndpointSubset) {
+	c.cache[clusterName] = subset
+}
+
+func (c EndpointCache) GetWithTags(serviceName string, tags map[string]string) []*registry.MicroServiceInstance {
+	// Get subsets whose clusterName matches the service name
+	matchedSubsets := []EndpointSubset{}
+	for clusterName, subset := range c.cache {
+		info := ParseClusterName(clusterName)
+		if info != nil && info.ServiceName == serviceName {
+			matchedSubsets = append(matchedSubsets, subset)
+		}
 	}
 
-	registry.MicroserviceInstanceIndex.Set(clusterName, store)
+	if len(matchedSubsets) == 0 {
+		return nil
+	}
+
+	var instances []*registry.MicroServiceInstance
+
+	for _, subset := range matchedSubsets {
+		if tagsMatch(subset.tags, tags) {
+			instances = subset.instances
+			break
+		}
+
+	}
+	return instances
+}
+
+// TODO There might be some utils in go-chassis doing the same thing
+func tagsMatch(tags, targetTags map[string]string) bool {
+	matched := true
+	for k, v := range targetTags {
+		if val, exists := tags[k]; !exists || val != v {
+			matched = false
+			break
+		}
+	}
+	return matched
 }

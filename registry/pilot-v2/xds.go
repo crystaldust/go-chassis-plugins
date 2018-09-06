@@ -3,6 +3,7 @@ package pilotv2
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
 	"github.com/gogo/protobuf/proto"
 	"google.golang.org/grpc"
+	"k8s.io/client-go/rest"
 )
 
 type XdsClient struct {
@@ -22,6 +24,7 @@ type XdsClient struct {
 	nodeInfo    *NodeInfo
 	NodeID      string
 	NodeCluster string
+	k8sClient   *rest.RESTClient
 }
 
 type XdsType string
@@ -44,7 +47,7 @@ type NodeInfo struct {
 	InstanceIP string
 }
 
-func NewXdsClient(pilotAddr string, tlsConfig *tls.Config, nodeInfo *NodeInfo) (*XdsClient, error) {
+func NewXdsClient(pilotAddr string, tlsConfig *tls.Config, nodeInfo *NodeInfo, kubeconfigPath string) (*XdsClient, error) {
 	// TODO Handle the array
 	xdsClient := &XdsClient{
 		PilotAddr: pilotAddr,
@@ -68,7 +71,47 @@ func NewXdsClient(pilotAddr string, tlsConfig *tls.Config, nodeInfo *NodeInfo) (
 		TypeRds: &XdsReqCache{},
 	}
 
+	if k8sClient, err := CreateK8SRestClient(kubeconfigPath, "apis", "networking.istio.io", "v1alpha3"); err != nil {
+		return nil, err
+	} else {
+		xdsClient.k8sClient = k8sClient
+	}
+
 	return xdsClient, nil
+}
+
+func (client *XdsClient) GetSubsetTags(namespace, hostName, subsetName string) (map[string]string, error) {
+	req := client.k8sClient.Get()
+	req.Resource("destinationrules")
+	req.Namespace(namespace)
+
+	result := req.Do()
+	rawBody, err := result.Raw()
+	if err != nil {
+		fmt.Println("Failed to get rawBody: ", err)
+		return nil, err
+	}
+
+	var drResult DestinationRuleResult
+	json.Unmarshal(rawBody, &drResult)
+
+	// Find the subset
+	tags := map[string]string{}
+	for _, dr := range drResult.Items {
+		if dr.Spec.Host == hostName {
+			for _, subset := range dr.Spec.Subsets {
+				if subset.Name == subsetName {
+					for k, v := range subset.Labels {
+						tags[k] = v
+					}
+					break
+				}
+			}
+			break
+		}
+	}
+
+	return tags, nil
 }
 
 func getAdsResClient(client *XdsClient) (v2.AggregatedDiscoveryService_StreamAggregatedResourcesClient, error) {
@@ -221,7 +264,7 @@ func (client *XdsClient) GetEndpointsByTags(serviceName string, tags map[string]
 		}
 		fmt.Println("try ", cluster.Name)
 		// So clusterInfo is not nil and subset is not empty
-		if subsetTags, err := cacheManager.GetSubsetTags(clusterInfo.Namespace, clusterInfo.ServiceName, clusterInfo.Subset); err == nil {
+		if subsetTags, err := client.GetSubsetTags(clusterInfo.Namespace, clusterInfo.ServiceName, clusterInfo.Subset); err == nil {
 			fmt.Println("subsetTags: ", cluster.Name, subsetTags)
 			// filter with tags
 			matched := true
@@ -238,12 +281,14 @@ func (client *XdsClient) GetEndpointsByTags(serviceName string, tags map[string]
 				clusterName = cluster.Name
 				loadAssignment, err := client.EDS(cluster.Name)
 				if err != nil {
+					fmt.Println("failed to get load assignment")
 					return nil, clusterName, err
 				}
 
 				for _, item := range loadAssignment.Endpoints {
 					lbendpoints = append(lbendpoints, item.LbEndpoints...)
 				}
+				fmt.Println("got ", len(lbendpoints), "lbendpoints")
 
 				return lbendpoints, clusterName, nil
 			}
