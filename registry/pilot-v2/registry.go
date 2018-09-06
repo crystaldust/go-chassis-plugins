@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/go-chassis/go-archaius/lager"
 	"github.com/go-chassis/go-chassis/core/common"
 	"github.com/go-chassis/go-chassis/core/metadata"
 	"github.com/go-chassis/go-chassis/core/registry"
@@ -19,6 +20,10 @@ var (
 	POD_NAME      string
 	POD_NAMESPACE string
 	INSTANCE_IP   string
+)
+
+const (
+	PilotV2Registry = "pilotv2"
 )
 
 type ServiceDiscovery struct {
@@ -133,12 +138,7 @@ func (discovery *ServiceDiscovery) GetMicroServiceInstances(consumerID, provider
 }
 
 func (discovery *ServiceDiscovery) FindMicroServiceInstances(consumerID, microServiceName string, tags utiltags.Tags) ([]*registry.MicroServiceInstance, error) {
-	fmt.Println("FindMicroServiceInstances with params: ", consumerID, microServiceName, tags)
-	jsonPrint(tags)
-	// Try to get instances from index cache
-
 	instances := simpleCache.GetWithTags(microServiceName, tags.KV)
-
 	if instances == nil {
 		var lbendpoints []apiv2endpoint.LbEndpoint
 		var err error
@@ -161,8 +161,12 @@ func (discovery *ServiceDiscovery) FindMicroServiceInstances(consumerID, microSe
 var cacheManager *CacheManager
 
 func (discovery *ServiceDiscovery) AutoSync() {
-	fmt.Println("Pilot V2 Discovery AutoSync is in dirty debugging!")
-
+	fmt.Println("calling autosync")
+	if lager.Logger == nil {
+		fmt.Println("lager.Logger is nil")
+	} else {
+		lager.Logger.Infof("lager.Logger inited")
+	}
 	var err error
 	cacheManager, err = NewCacheManager(discovery.client, discovery.options.ConfigPath)
 	if err != nil {
@@ -195,7 +199,7 @@ func NewDiscoveryService(options registry.Options) registry.ServiceDiscovery {
 
 	discovery := &ServiceDiscovery{
 		client:  xdsClient,
-		Name:    "pilotv2",
+		Name:    PilotV2Registry,
 		options: options,
 	}
 
@@ -216,9 +220,7 @@ func init() {
 		POD_NAMESPACE = "default"
 	}
 	if INSTANCE_IP == "" {
-		// TODO Read ip from network adaptor
-		//
-		fmt.Println("[WARN] Env var INSTANCE_IP not found, the service might not work properly.")
+		fmt.Println("[WARN] Env var INSTANCE_IP not set, the service might not work properly.")
 		INSTANCE_IP = iputil.GetLocalIP()
 		if INSTANCE_IP == "" {
 			// Won't work without instance ip
@@ -226,5 +228,5 @@ func init() {
 		}
 	}
 
-	registry.InstallServiceDiscovery("pilotv2", NewDiscoveryService)
+	registry.InstallServiceDiscovery(PilotV2Registry, NewDiscoveryService)
 }
