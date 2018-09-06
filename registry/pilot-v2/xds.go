@@ -14,6 +14,7 @@ import (
 	"github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
 	"github.com/gogo/protobuf/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"k8s.io/client-go/rest"
 )
 
@@ -57,7 +58,15 @@ func NewXdsClient(pilotAddr string, tlsConfig *tls.Config, nodeInfo *NodeInfo, k
 	xdsClient.NodeCluster = nodeInfo.PodName
 
 	// TODO Handle the TLS certs
-	conn, err := grpc.Dial(xdsClient.PilotAddr, grpc.WithInsecure())
+	var conn *grpc.ClientConn
+	var err error
+
+	if tlsConfig != nil {
+		creds := credentials.NewTLS(tlsConfig)
+		conn, err = grpc.Dial(xdsClient.PilotAddr, grpc.WithTransportCredentials(creds))
+	} else {
+		conn, err = grpc.Dial(xdsClient.PilotAddr, grpc.WithInsecure())
+	}
 	if err != nil {
 		return nil, err
 	}
